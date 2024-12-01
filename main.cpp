@@ -7,19 +7,21 @@
 #include <cmath>
 
 // Struct to store frequency and binaryCode for a said character
-struct CharCode
+struct CharCode 
 {
     char character;
     int freq;
     std::string code;
 };
 
-// Struct to store the line, the vector of CharCode, and the encoded line for each thread
-struct EncodedMsg
-{
+// struct to store the shared data of the threads, including the line, id, counter, mutex1, mutex2, and condition
+struct SharedData {
     std::string line;
-    std::vector<CharCode> charCodeVec;
-    std::string encodedLine;
+    int id;
+    int* counter;
+    pthread_mutex_t* mutex1;
+    pthread_mutex_t* mutex2;
+    pthread_cond_t* condition;
 };
 
 // Used for sorting function, Compares frequency first then if equal, compares character 
@@ -73,34 +75,41 @@ std::string decimalToBinary(float decimal, int precision)
 
 void *shannonCode(void *void_ptr) 
 {
-    // change the void_ptr into a string line_ptr
-    EncodedMsg *curr_ptr = (EncodedMsg *) void_ptr;
-    
-    int lineSize = (curr_ptr->line).length();
+    SharedData *data = (SharedData *) void_ptr;
+
+    // copy the data into local variables
+    std::string line = data->line;
+    int localID = data->id;
+
+    // unlock mutex1 to allow other threads to set their data
+    pthread_mutex_unlock(data->mutex1);
+
+    int lineSize = line.length();
 
     // create a mapping to store each unique character and count their appearances 
     std::map<char, int> charCountMap;
 
     // iterate through each character for the given line
-    // NOTE: COULD skip the mapping part and do this in the charCode struct 
-    for (int i = 0; i < lineSize; ++i) 
+    for (int i = 0; i < lineSize; ++i)
     {
         // Stores unqiue characters and their associated frequencies from the line
-        ++charCountMap[curr_ptr->line[i]];
+        ++charCountMap[line[i]];
     }
 
-    // vector to sort the frequencies 
+    // vector to store CharCode
+    std::vector<CharCode> charCodeVec;
+
     CharCode temp;
     for (const auto& charCount: charCountMap)
     {
         temp.character = charCount.first;
         temp.freq = charCount.second;
         // each entry in the charCodeVec holds its character and associated frequency so far
-        curr_ptr->charCodeVec.push_back(temp);
+        charCodeVec.push_back(temp);
     }
 
     // sorts the charCodeVec based on frequencies, and if equal then characters
-    std::sort(curr_ptr->charCodeVec.begin(), curr_ptr->charCodeVec.end(), compareFreqChar);
+    std::sort(charCodeVec.begin(), charCodeVec.end(), compareFreqChar);
 
     // Keeps track of the Cumulative Probability as we iterate through the charCode vector
     float cumulativeProbability = 0;
@@ -109,7 +118,7 @@ void *shannonCode(void *void_ptr)
     std::map<char, std::string> charCodeMap;
 
     // finds the binary code for each character based on its frequency/probability
-    for (auto& charCode : curr_ptr->charCodeVec) 
+    for (auto& charCode : charCodeVec) 
     {
         // probability = frequency / total freq (total freq is just the length of the line)
         float probability = ((float)charCode.freq/lineSize);
@@ -126,14 +135,54 @@ void *shannonCode(void *void_ptr)
         cumulativeProbability += probability;
     }
 
+
     // holds the finished encoded line
-    curr_ptr->encodedLine = "";
+    std::string encodedLine = "";
 
     // iterates over the intial line
     for (int i = 0; i < lineSize; ++i) {
         // Adds each encountered characters associated shannon code to the finished encoded line 
-        curr_ptr->encodedLine += charCodeMap[curr_ptr->line[i]];
+        encodedLine += charCodeMap[line[i]];
     }
+
+    pthread_mutex_lock(data->mutex2);
+
+    // Before printing, synchronize to ensure threads print in order
+    while (localID != *(data->counter)) {
+        pthread_cond_wait(data->condition, data->mutex2);
+    }
+
+    pthread_mutex_unlock(data->mutex2);
+
+    // prints out the shannon code information for each thread
+    std::cout << "Message: " << line << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "Alphabet:" << std::endl;
+
+    // prints out the each symbol in the line and their associated frequency and shannon code 
+    for (const auto& charCode : charCodeVec) {
+        std::cout << "Symbol: " << charCode.character
+        << ", Frequency: " << charCode.freq
+        << ", Shannon code: " << charCode.code << std::endl;
+    }
+
+    std::cout << std::endl;
+
+    std::cout << "Encoded message: " << encodedLine << std::endl;
+
+    std::cout << std::endl;
+
+    // Lock mutex2 before modifying sharedData
+    pthread_mutex_lock(data->mutex2);
+
+    // increment the counter
+    (*(data->counter))++;
+
+    // signal the condition variable
+    pthread_cond_broadcast(data->condition);
+
+    pthread_mutex_unlock(data->mutex2);
 
     return nullptr;
 }
@@ -141,60 +190,63 @@ void *shannonCode(void *void_ptr)
 
 int main() 
 {
-    // store each line into a different initialization of a vector of struct EncodedMsg
-    EncodedMsg input;
-    std::vector<EncodedMsg> threadData;
+    // store each line into a different initialization of a vector
+    std::vector<std::string> inputLines;
+    std::string line;
 
     // take in the input 
-    while(std::getline(std::cin, input.line)) {
-        threadData.push_back(input);
+    while (std::getline(std::cin, line)) {
+        inputLines.push_back(line);
     }
-    
-    int threadSize = threadData.size();
 
-    // store the thread id in tid
-    pthread_t *tid = new pthread_t[threadSize];
+    int threadSize = inputLines.size();
 
-    // iterate through the vector
-    for (int i = 0; i < threadSize; i++)
-    {
+    // initialize synchronization variables
+    pthread_mutex_t mutex1;
+    pthread_mutex_init(&mutex1, nullptr);
+
+    pthread_mutex_t mutex2;
+    pthread_mutex_init(&mutex2, nullptr);
+
+    pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+
+    int counter = 0;
+
+    // initialize shared data
+    SharedData sharedData;
+    sharedData.counter = &counter;
+    sharedData.mutex1 = &mutex1;
+    sharedData.mutex2 = &mutex2;
+    sharedData.condition = &condition;
+
+    // vector to store thread IDs to join later
+    std::vector<pthread_t> threadVector;
+
+    for (int i = 0; i < threadSize; i++) {
+        pthread_t tid;
+
+        // lock mutex1 before modifying sharedData
+        pthread_mutex_lock(&mutex1);
+
+        // set the data (line and id) for the thread
+        sharedData.line = inputLines[i];
+        sharedData.id = i;
+
         // create a thread for each EncodedMsg struct of the vector, and if an error is thrown return 1;
-        if(pthread_create(&tid[i], nullptr, shannonCode, &threadData[i]))
+        if(pthread_create(&tid, nullptr, shannonCode, &sharedData)) 
         {
             std::cerr << "Error creating thread" << std::endl;
-			return 1;
+            return 1;
         }
+
+        // store thread IDs in vector
+        threadVector.push_back(tid);
     }
 
     // join threads back together when they are finished
-    for (int i = 0; i < threadSize; i++)
+    for (int i = 0; i < threadSize; i++) 
     {
-        pthread_join(tid[i], nullptr);
-    }
-
-    // prints out the shannon code information for each thread
-    for (int i = 0; i < threadSize; i++) {
-        EncodedMsg currData = threadData[i];
-
-        std::cout << "Message: " << currData.line << std::endl;
-        std::cout << std::endl;
-
-        std::cout << "Alphabet:" << std::endl;
-
-        // prints out the each symbol in the line and their associated frequency and shannon code 
-        for (const auto& charCode : currData.charCodeVec) 
-        {
-            std::cout << "Symbol: "<< charCode.character
-            << ", Frequency: " << charCode.freq 
-            << ", Shannon code: " << charCode.code << std::endl;
-        }
-
-        std::cout << std::endl;
-
-        std::cout << "Encoded message: " << currData.encodedLine << std::endl;
-
-        std::cout << std::endl;
-
+        pthread_join(threadVector[i], nullptr);
     }
 
     return 0;
